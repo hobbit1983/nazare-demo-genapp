@@ -1,0 +1,29 @@
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+      {
+          "type": "zOpenDebug",
+          "request": "attach",
+          "name": "List parked IBM Z Open Debug sessions wazidev-demo",
+          "useConnectionDetailsFromSettings": false,
+          "ignoreCertificateErrors": true,
+          "host": "wazidev-demo-inf.fyre.ibm.com",
+          "port": 32742,//Use related port to remote-debug-service 7394
+          "secure": true
+      },
+      {
+          "type": "zOpenDebug",
+          "request": "launch",
+          "name": "Connect to parked IBM Z Open Debug session wazidev-demo",
+          "useConnectionDetailsFromSettings": false,
+          "password": "${command:AskForPassword}",
+          "ignoreCertificateErrors": true,
+          "host": "wazidev-demo-inf.fyre.ibm.com",
+          "port": 32742,//Use related port to remote-debug-service 7394
+          "secure": true
+      }
+  ]
+}

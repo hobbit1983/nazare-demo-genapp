@@ -1,0 +1,187 @@
+stages:
+  - zappbuild
+  - build
+  - package
+  - deploy
+  - integration
+
+# This stage will checkout the zAppBuild project for DBB Build
+zAppBuild:
+  stage: zappbuild
+  rules:
+  - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master"'
+  trigger:
+    project: IBMZSoftware/nazare-demo-sysadmin
+    branch: master
+    strategy: depend
+
+# Pipeline global variables
+variables:
+  # Fixed values
+  CI_DEBUG_TRACE: "false"
+  GIT_SSL_NO_VERIFY: "true"
+  BUILD_WORKING_DIR: "build-$CI_PIPELINE_ID"
+  DBB_HOME: "/usr/lpp/IBM/dbb"
+  DBB_HLQ: "NAZARE.WAZI.GENAPP"
+  DBB_GROOVYZ_OPTS: "-DBB_DAEMON_PORT 7380 -DBB_DAEMON_HOST 127.0.0.1"
+  DBB_EXTRA_OPTS: "-d"
+  DBB_BUILD_TYPE: "-m"
+  DBB_CREDENTIAL_OPTIONS: "-id ADMIN -pw ADMIN"
+  APP_ARCHIVE: NAZAREGenApp-1.0.0.tar
+  ZCEE_PORT: "9080"
+  ZCEE_HOST: "127.0.0.1"
+  # OpenShift Cluster/zTrial specific values (valued in GitLab project)
+  DBB_URL: "$E2E_DBB_URL"
+  ARTI_USER: "$E2E_ARTI_USER"
+  ARTI_PASSWORD: "$E2E_ARTI_PASSWORD"
+  ARTI_URL: "$E2E_ARTI_URL"
+  ARTI_REPO_PATH: "$E2E_ARTI_REPO_PATH/nazare-demo-genapp/gitlab"
+  ZCEE_USER: "$E2E_ZCEE_USER"
+  ZCEE_PASSWORD: "$E2E_ZCEE_PASSWORD"
+
+DBB Build:
+  stage: build
+  dependencies: []
+  rules:
+  - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master"'
+  before_script:
+  - |
+    # https://gitlab.com/gitlab-org/gitlab/-/issues/15409
+    echo "Checkout: $CI_COMMIT_REF_NAME $CI_COMMIT_SHA"
+    git checkout -B "$CI_COMMIT_REF_NAME" "$CI_COMMIT_SHA"
+    git fetch origin
+  script:
+  - |
+    #env
+    rc=0
+    rm -rf $BUILD_WORKING_DIR
+    mkdir -p $BUILD_WORKING_DIR
+    chmod 777 $BUILD_WORKING_DIR
+    set +e
+    set -o xtrace
+    $DBB_HOME/bin/groovyz $DBB_GROOVYZ_OPTS\
+      $PWD/../nazare-demo-sysadmin/zAppBuild/build.groovy\
+      --application nazare-demo-genapp\
+      --logEncoding UTF-8 -w $PWD/.. --sourceDir $PWD/.. --workDir $PWD/$BUILD_WORKING_DIR\
+      --hlq ${DBB_HLQ} --url $DBB_URL $DBB_CREDENTIAL_OPTIONS $DBB_BUILD_TYPE $DBB_EXTRA_OPTS
+    rc=$?
+    set +o xtrace
+    exit $rc
+  artifacts:
+    when: always
+    paths:
+      - build-$CI_PIPELINE_ID
+  tags:
+    - zos-shell
+
+Package:
+  stage: package
+  dependencies: []
+  rules:
+  - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master"'
+  variables:
+    GIT_STRATEGY: none
+    GIT_CHECKOUT: "false"
+  script:
+  - |
+    set -o xtrace
+    BUILD_OUTPUT_FOLDER=$(ls ${BUILD_WORKING_DIR} | grep "build.*[0-9]$" | tail -n 1)
+    $DBB_HOME/bin/groovyz $DBB_GROOVYZ_OPTS\
+      $PWD/../nazare-demo-sysadmin/Pipeline/Zar/Package.groovy\
+     -a $PWD/../nazare-demo-genapp/application-conf\
+     -s $PWD/../nazare-demo-genapp\
+     -b $PWD/../nazare-demo-sysadmin\
+     -w $PWD/${BUILD_WORKING_DIR}/${BUILD_OUTPUT_FOLDER}\
+     -hl ${DBB_HLQ}\
+     -n ${CI_PIPELINE_ID}\
+     -r ${ARTI_URL}/${ARTI_REPO_PATH}
+    
+    if [ -f $PWD/${BUILD_WORKING_DIR}/${BUILD_OUTPUT_FOLDER}/${APP_ARCHIVE} ]
+    then
+      $DBB_HOME/bin/groovyz $DBB_GROOVYZ_OPTS\
+        $PWD/../nazare-demo-sysadmin/Pipeline/Zar/Artifactory.groovy\
+         --url $ARTI_URL/$ARTI_REPO_PATH/$CI_PIPELINE_ID/${APP_ARCHIVE}\
+         --user $ARTI_USER\
+         --password $ARTI_PASSWORD\
+         --fileToUpload $PWD/${BUILD_WORKING_DIR}/${BUILD_OUTPUT_FOLDER}/${APP_ARCHIVE}
+    else
+      echo "Nothing to package."
+    fi
+    set +o xtrace
+  tags:
+    - zos-shell
+
+
+Deploy:
+  stage: deploy
+  dependencies: []
+  rules:
+  - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master"'
+  variables:
+    GIT_STRATEGY: none
+    GIT_CHECKOUT: "false"
+  script:
+  - |
+    set -o xtrace
+    BUILD_OUTPUT_FOLDER=$(ls $PWD/${BUILD_WORKING_DIR} | grep "build.*[0-9]$" | tail -n 1)
+    if [ -f $PWD/${BUILD_WORKING_DIR}/${BUILD_OUTPUT_FOLDER}/${APP_ARCHIVE} ]
+    then    
+      $DBB_HOME/bin/groovyz $DBB_GROOVYZ_OPTS\
+        $PWD/../nazare-demo-sysadmin/Pipeline/Zar/Artifactory.groovy\
+        --url $ARTI_URL/$ARTI_REPO_PATH/$CI_PIPELINE_ID/${APP_ARCHIVE}\
+        --user $ARTI_USER\
+        --password $ARTI_PASSWORD\
+        --fileToDownload $PWD/${BUILD_WORKING_DIR}/${APP_ARCHIVE}
+      
+      # Override default value if needed (no sed -i option in z/OS)
+      cp $PWD/../nazare-demo-genapp/application-conf/deploy.yaml $PWD/${BUILD_WORKING_DIR}
+      if [ -n "${CICS_PLEX}" ]
+      then
+        sed "s!cics.cicsplex:.*!cics.cicsplex: $CICS_PLEX!g" $PWD/${BUILD_WORKING_DIR}/deploy.yaml > $PWD/${BUILD_WORKING_DIR}/deploy.yaml.tmp
+        mv $PWD/${BUILD_WORKING_DIR}/deploy.yaml.tmp $PWD/${BUILD_WORKING_DIR}/deploy.yaml
+      fi
+      if [ -n "${CICS_CMCI_URL}" ]
+      then
+        sed "s!cics.cmciurl:.*!cics.cmciurl: $CICS_CMCI_URL!g" $PWD/${BUILD_WORKING_DIR}/deploy.yaml > $PWD/${BUILD_WORKING_DIR}/deploy.yaml.tmp
+        mv $PWD/${BUILD_WORKING_DIR}/deploy.yaml.tmp $PWD/${BUILD_WORKING_DIR}/deploy.yaml
+      fi
+      
+      $DBB_HOME/bin/groovyz $DBB_GROOVYZ_OPTS\
+        $PWD/../nazare-demo-sysadmin/Pipeline/Zar/CicsDeploy.groovy\
+        -w $PWD/${BUILD_WORKING_DIR}\
+        -t $PWD/${BUILD_WORKING_DIR}/${APP_ARCHIVE}\
+        -y $PWD/${BUILD_WORKING_DIR}/deploy.yaml
+    else
+      echo "Nothing to deploy."
+    fi    
+    set +o xtrace
+  tags:
+    - zos-shell
+  artifacts:
+    when: always
+    paths:
+      - build-$CI_PIPELINE_ID/*.log   
+
+Integration Test:
+  stage: integration
+  dependencies: []
+  rules:
+  - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master"'
+  variables:
+    GIT_STRATEGY: none
+    GIT_CHECKOUT: "false"
+  script:
+  - |
+    cd $BUILD_WORKING_DIR
+    set +e
+    set -o xtrace
+    $DBB_HOME/bin/groovyz $DBB_GROOVYZ_OPTS\
+      $PWD/../../nazare-demo-sysadmin/Pipeline/Zar/SimpleRestClient.groovy\
+      -u http://$ZCEE_HOST:$ZCEE_PORT/genapp/motorPolicy/2/1\
+      -U $ZCEE_USER -P $ZCEE_PASSWORD -k -m GET > api.log 
+    set +o xtrace
+    cat api.log
+    grep -q "CustomerNumber..2"  api.log
+    exit $?
+  tags:
+    - zos-shell

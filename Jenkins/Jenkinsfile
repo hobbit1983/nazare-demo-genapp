@@ -1,0 +1,380 @@
+// Agents Labels
+def linuxAgent = 'master'
+def zOsAgentLabel = env.ZOS_AGENT_LABEL ? env.ZOS_AGENT_LABEL : 'zos-e2e-pipeline'
+
+// DBB
+def dbbDaemonPort = null
+def dbbDefaultbHlq = 'NAZARE.WAZI'
+def dbbDefaultBuildType='-i'
+
+// GIT
+def gitCredId = 'id-sshsecret'
+def gitOrg = 'IBMZSoftware'
+def gitHost = 'github.ibm.com'
+def srcGitRepo =   'git@'+gitHost+':'+gitOrg+'/nazare-demo-genapp.git'
+def adminGitRepo = 'git@'+gitHost+':'+gitOrg+'/nazare-demo-sysadmin.git'
+def adminGitBranch = 'wazi-sandbox'
+def srcGitBranch = 'wazi-sandbox'
+
+
+// Artifactory
+def serverId = "ArtifactoryE2EPipeline"
+def server = Artifactory.server serverId
+def artiCredentialsId = 'id-artifactory'
+def repository = "wazi-e2e-pipeline-generic-local"
+def repositoryFolder = "nazare-demo-genapp/scripted"
+def repositoryPath = repository + "/" + repositoryFolder
+
+// ZCEE
+def zceeCredId = 'id-zcee'
+def zceeUrl = null
+
+// ZOS
+def zosSshCredId = 'id-sshsecret'
+
+// Verbose
+def verbose = env.VERBOSE && env.VERBOSE == 'true' ? true : false
+
+// Private
+def hasBuildFiles = true
+def buildVerbose = verbose ? '-v' : ''
+def appName = null
+def appVersion = null
+ 
+def isPullOrMergeRequest ( ) {
+    def isMr = env.CHANGE_ID != null || ( env.gitlabActionType != null && env.gitlabActionType == 'MERGE' )            
+    if ( isMr && env.CHANGE_ID == null )
+        env.CHANGE_ID = env.gitlabMergeRequestIid
+    return isMr
+}
+
+pipeline {
+
+    agent { label linuxAgent }
+
+    options { skipDefaultCheckout(true) }
+
+    stages {
+        stage('Init') {
+            steps {
+                script {
+                    if ( verbose ) {
+                        echo sh(script: 'env|sort', returnStdout: true)
+                    }
+                    if ( env.PROJECT_NAME ) {
+                      gitCredId = env.PROJECT_NAME + '-sshsecret'
+                      zosSshCredId = env.PROJECT_NAME + '-sshsecret'
+                      artiCredentialsId = env.PROJECT_NAME + '-artifactory'
+                      zceeCredId = env.PROJECT_NAME + '-zcee'
+                    }
+                }
+            }
+        }
+        
+        stage('Git Clone/Refresh') {
+            agent { label zOsAgentLabel }
+            steps {
+                script {
+                    try {
+                        srcGitRepo = scm.getUserRemoteConfigs()[0].getUrl()
+                        srcGitBranch = scm.branches[0].name
+                        adminGitRepo = srcGitRepo.substring(0, srcGitRepo.lastIndexOf('/')) + "/nazare-demo-sysadmin.git"
+                        adminGitBranch = srcGitBranch
+                    } catch ( Exception ex ) {
+                    } 
+                    println "URL is   : $srcGitRepo"
+                    println "Branch is: $srcGitBranch"
+                    if ( verbose ) {
+                        echo sh(script: 'env|sort', returnStdout: true)
+                    }
+                    dir('nazare-demo-genapp') {
+                        // Root location of the groovy script.
+                        env.WORKSPACE_ROOT = "${WORKSPACE}".substring(0, "${WORKSPACE}".lastIndexOf('/')) + "/" + gitOrg + "/" + adminGitBranch
+                        if ( isPullOrMergeRequest ( ) ) {
+                            // This is a pull/merge request
+                            def isGitLab = env.gitlabActionType != null
+                            def gitBranch = isGitLab ? "merge-requests/${env.CHANGE_ID}" : "PR-${env.CHANGE_ID}"
+                            def gitRefspecBranch = isGitLab ? 
+                                     "+refs/merge-requests/${env.CHANGE_ID}/head:refs/remotes/merge-requests/${env.CHANGE_ID} " +
+                                     "+refs/merge-requests/${env.CHANGE_ID}/head:refs/remotes/origin/merge-requests/${env.CHANGE_ID} " :
+                                    " +refs/pull/${env.CHANGE_ID}/head:refs/remotes/origin/PR-${env.CHANGE_ID}"
+                            def scmVars = checkout([$class: 'GitSCM',
+                                branches: [[name: gitBranch ]],
+                                doGenerateSubmoduleConfigurations: false,
+                                userRemoteConfigs: [
+                                    [refspec:gitRefspecBranch ,
+                                        url: srcGitRepo, credentialsId: gitCredId,
+                                        ]]
+                            ])
+                            env.GIT_COMMIT =  scmVars.GIT_COMMIT
+                            if ( isGitLab ) {
+                                 env.CHANGE_BRANCH = env.gitlabSourceBranch
+                                 env.GIT_COMMIT =  env.gitlabMergeRequestLastCommit
+                            }
+                            println "git checkout -B ${env.CHANGE_BRANCH} ${env.GIT_COMMIT}"
+                            sh "git checkout -B ${env.CHANGE_BRANCH} ${env.GIT_COMMIT}"	
+                        } else {
+                            checkout([$class: 'GitSCM', branches: [[name: srcGitBranch]],
+                                                doGenerateSubmoduleConfigurations: false,
+                                                submoduleCfg: [],
+                                                userRemoteConfigs: [[
+                                                                     credentialsId: gitCredId,
+                                                                     url: srcGitRepo,
+                                                                     ]]])
+                        }
+                    }
+                    
+                    dir("${env.WORKSPACE_ROOT}/nazare-demo-sysadmin") {
+                        checkout([$class: 'GitSCM', branches: [[name: adminGitBranch]],
+                              doGenerateSubmoduleConfigurations: false,
+                              submoduleCfg: [],
+                            userRemoteConfigs: [[
+                                credentialsId: gitCredId,
+                                url: adminGitRepo,
+                            ]]])
+                    }
+                }
+            }
+        }
+
+        stage('DBB Build') {
+            steps {
+                script{
+                    node( zOsAgentLabel ) {
+                        if ( env.DBB_BUILD_TYPE == null )
+                            env.DBB_BUILD_TYPE = dbbDefaultBuildType
+                        if ( env.DBB_HLQ == null )
+                            env.DBB_HLQ = dbbDefaultbHlq
+                        if ( env.GROOVYZ_BUILD_EXTRA_OPTS == null )
+                            env.GROOVYZ_BUILD_EXTRA_OPTS = ""
+                        if ( env.DBB_DAEMON_PORT != null )
+                            env.GROOVYZ_BUILD_EXTRA_OPTS = "${env.GROOVYZ_BUILD_EXTRA_OPTS} -DBB_DAEMON_PORT ${env.DBB_DAEMON_PORT} -DBB_DAEMON_HOST 127.0.0.1"
+                        env.DBB_VERBOSE = buildVerbose
+                        def rc = sh (returnStatus: true, script: '''#!/bin/sh
+                            rm -rf ${WORKSPACE}/BUILD-${BUILD_NUMBER}
+                            if [ ! -z DBB_DAEMON_PORT ]
+                            then
+                               mkdir -p ${WORKSPACE}/BUILD-${BUILD_NUMBER}
+                               chmod 777 ${WORKSPACE}/BUILD-${BUILD_NUMBER}
+                            fi
+                            CMD="$DBB_HOME/bin/groovyz $GROOVYZ_BUILD_EXTRA_OPTS ${WORKSPACE_ROOT}/nazare-demo-sysadmin/zAppBuild/build.groovy\
+                                --logEncoding UTF-8 -w ${WORKSPACE} --application nazare-demo-genapp --sourceDir ${WORKSPACE}\
+                                --workDir ${WORKSPACE}/BUILD-${BUILD_NUMBER}  --hlq ${DBB_HLQ}.GENAPP --url $DBB_URL -pw ADMIN -d $DBB_BUILD_TYPE $DBB_BUILD_EXTRA_OPTS $DBB_VERBOSE"
+                            echo $CMD
+                            $CMD
+                            exit $?
+                        ''')
+                        if ( rc != 0 )
+                            error("DBB Build failed!!!")
+                        // Do not deploy if nothing in the build list
+                        def files = findFiles(glob: "**BUILD-${BUILD_NUMBER}/**/buildList.txt")
+                        hasBuildFiles = files.length > 0 && files[0].length > 0
+                    }
+                }
+            }
+            post {
+                always {
+                    node( zOsAgentLabel ) {
+                        dir("${WORKSPACE}/BUILD-${BUILD_NUMBER}") {
+                            archiveArtifacts allowEmptyArchive: true,
+                                            artifacts: '**/*.log,**/*.json,**/*.html',
+                                            excludes: '**/*clist',
+                                            onlyIfSuccessful: false
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Package') {
+            steps {
+                script {
+                    node( zOsAgentLabel ) {
+                        if ( hasBuildFiles ) {
+                            if ( env.ARTI_REPO != null ) {
+                                repository = env.ARTI_REPO
+                                repositoryPath = repository + "/" + repositoryFolder
+                            }
+                            BUILD_OUTPUT_FOLDER = sh (script: "ls ${WORKSPACE}/BUILD-${BUILD_NUMBER} | grep \"build.*[0-9]\$\" | tail -n 1", returnStdout: true).trim()
+                            dir("${WORKSPACE}/BUILD-${BUILD_NUMBER}/${BUILD_OUTPUT_FOLDER}") {
+                                server.credentialsId = artiCredentialsId
+                                println "Artifactory credential id: ${artiCredentialsId}"
+                                sh "$DBB_HOME/bin/groovyz $GROOVYZ_BUILD_EXTRA_OPTS ${WORKSPACE_ROOT}/nazare-demo-sysadmin/Pipeline/Zar/Package.groovy\
+                                       -a ${WORKSPACE}/nazare-demo-genapp/application-conf\
+                                       -s ${WORKSPACE}/nazare-demo-genapp\
+                                       -b ${WORKSPACE_ROOT}/nazare-demo-sysadmin\
+                                       -w ${WORKSPACE}/BUILD-${BUILD_NUMBER}/${BUILD_OUTPUT_FOLDER}\
+                                       -hl ${DBB_HLQ}.GENAPP\
+                                       -n ${BUILD_NUMBER}\
+                                       -r ${server.url}/${repositoryPath}"
+                                       
+                                def fileContents = readFile file: "${WORKSPACE}/nazare-demo-genapp/application-conf/app.yaml", encoding: "UTF-8"
+                                def datas = readYaml text: fileContents
+                                appName = datas['name']
+                                appVersion = datas['version']
+                                println "Artifactory publish url: ${server.url}/${repositoryPath}/${appVersion}/${srcGitBranch}/${BUILD_NUMBER}/${appName}-${appVersion}.tar"
+                                def pattern = "${appName}-${appVersion}.tar"
+                                def target = "${repositoryPath}/${appVersion}/${srcGitBranch}/${BUILD_NUMBER}/"
+                                if ( env.ZOS_SFTP_USER )
+                                    uploadToArtifactory(server, pattern, target, linuxAgent, zosSshCredId, env.ZOS_SFTP_USER, env.ZOS_SFTP_HOST, env.ZOS_SFTP_PORT, 
+                                        "${WORKSPACE}/BUILD-${BUILD_NUMBER}/${BUILD_OUTPUT_FOLDER}") // For zD&T
+                                else
+                                    uploadToArtifactory(server, pattern, target)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy') {
+            steps {
+                script{
+                    node( zOsAgentLabel ) { 
+                        if ( hasBuildFiles ) {
+                            server.credentialsId = artiCredentialsId
+                            def deployInputFile = "${WORKSPACE}/nazare-demo-genapp/application-conf/deploy.yaml"
+                            if ( env.DEPLOY_INPUT_FILE ) {
+                                    deployInputFile = env.DEPLOY_INPUT_FILE
+                            }
+                            def pattern = "${repositoryPath}/${appVersion}/${srcGitBranch}/${BUILD_NUMBER}/*"
+                            def target = "./BUILD-${BUILD_NUMBER}/tempDownload/"
+                            sh "mkdir -p ${target}/${repositoryFolder}/${appVersion}/${srcGitBranch}/${BUILD_NUMBER}"
+                            if ( env.ZOS_SFTP_USER )
+                                downloadFromArtifactory(server, pattern, target, linuxAgent, zosSshCredId, env.ZOS_SFTP_USER, env.ZOS_SFTP_HOST, env.ZOS_SFTP_PORT,
+                                         "${WORKSPACE}/${target}/${repositoryFolder}/${appVersion}/${srcGitBranch}/${BUILD_NUMBER}") // For zD&T
+                            else
+                                downloadFromArtifactory(server, pattern, target)
+                            sh "$DBB_HOME/bin/groovyz $GROOVYZ_BUILD_EXTRA_OPTS ${WORKSPACE_ROOT}/nazare-demo-sysadmin/Pipeline/Zar/CicsDeploy.groovy\
+                                   -w ${WORKSPACE}/BUILD-${BUILD_NUMBER}\
+                                   -t ${WORKSPACE}/${target}/${repositoryFolder}/${appVersion}/${srcGitBranch}/${BUILD_NUMBER}/${appName}-${appVersion}.tar\
+                                   -y ${deployInputFile} $buildVerbose"
+                            
+                        }
+                    }
+                }
+            }
+            post {
+                always {
+                    node( zOsAgentLabel ) {
+                        dir("${WORKSPACE}/BUILD-${BUILD_NUMBER}") {
+                            archiveArtifacts allowEmptyArchive: true, 
+                                            artifacts: '*_bind.log,*_refresh.log', 
+                                            onlyIfSuccessful: false
+                        }
+                    }
+                }
+            }    
+        }
+        stage ('Integration Tests'){
+             steps {
+                   script{
+                       node( zOsAgentLabel ) {
+                           if ( env.ZCEE_CRED_ID ) {
+                               zceeCredId = env.ZCEE_CRED_ID
+                           }
+                           zceeUrl = env.ZCEE_URL
+                        }
+                        withCredentials([usernamePassword(credentialsId: zceeCredId, usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                                // Very basic for now
+                                env.ZCEE_URL = zceeUrl
+                                def rc = sh (returnStatus: true, script: '''#!/bin/sh
+                                    mkdir -p /tmp/BUILD-${BUILD_NUMBER}
+                                    echo "curl  --silent -k -u $USERNAME:$PASSWORD -H \"Content-Type:application/json\" -X GET $ZCEE_URL/genapp/motorPolicy/2/1 > /tmp/BUILD-${BUILD_NUMBER}/api.log"
+                                    curl --silent -k -u $USERNAME:$PASSWORD -H "Content-Type:application/json" -X GET $ZCEE_URL/genapp/motorPolicy/2/1 > /tmp/BUILD-${BUILD_NUMBER}/api.log
+                                    grep "CustomerNumber..2"  /tmp/BUILD-${BUILD_NUMBER}/api.log
+                                    exit $?
+                               ''')
+                               if ( rc != 0 ) {
+                                   def result = sh (script: "cat /tmp/BUILD-${BUILD_NUMBER}/api.log", returnStdout: true).trim()
+                                   println "$result"
+                                   error("Integration Tests failed!!!")
+                               }
+                        }
+                  }
+             }
+        }
+    }
+}
+
+// Artifactory upload
+void uploadToArtifactory(server, pattern, target, uploadAgent, zosSshCredId, zosSftpUser, zosSftpHost, zosSftpPort, zosSftpTargetFolder){
+  node( uploadAgent ) {
+    if ( zosSshCredId != null ) {
+        env.PATTERN = "${pattern}"
+        env.ZOS_SFTP_USER = "${zosSftpUser}"
+        env.ZOS_SFTP_HOST = "${zosSftpHost}"
+        env.ZOS_SFTP_PORT = "${zosSftpPort}"
+        env.WORKSPACE_ZOS = "${zosSftpTargetFolder}"
+        withCredentials([sshUserPrivateKey(credentialsId: zosSshCredId, keyFileVariable: 'keyfile')]) {
+            def rc = sh (returnStatus: true, script: '''#!/usr/bin/env bash
+mkdir -p $(dirname $PATTERN)
+cd $(dirname $PATTERN)
+echo "sftp -i ${keyfile} -P ${ZOS_SFTP_PORT} -o "StrictHostKeyChecking=no" ${ZOS_SFTP_USER}@${ZOS_SFTP_HOST}"
+sftp -i ${keyfile} -P ${ZOS_SFTP_PORT} -o "StrictHostKeyChecking=no" ${ZOS_SFTP_USER}@${ZOS_SFTP_HOST} <<EOF
+cd $WORKSPACE_ZOS
+get $PATTERN
+EOF
+exit $?
+''')
+            if ( rc != 0 )
+                error("Upload to artifactory failed!!!")
+        }
+    }
+    uploadToArtifactory(server, pattern, target)
+  }
+}
+
+void uploadToArtifactory(server, pattern, target){
+    def buildInfo = server.upload  spec:
+        """{
+            "files": [
+                {
+                    "pattern": "${pattern}",
+                    "target": "${target}"
+                }
+                ]
+        }"""
+            
+    // Publish the build info to artifactory
+    server.publishBuildInfo buildInfo
+}
+
+// Artifactory download
+void downloadFromArtifactory(server, pattern, target, uploadAgent, zosSshCredId, zosSftpUser, zosSftpHost, zosSftpPort, zosSftpTargetFolder){
+  node( uploadAgent ) {
+    downloadFromArtifactory(server, pattern, target)
+    if ( zosSshCredId != null ) {
+        env.PATTERN = "${pattern}"
+        env.ZOS_SFTP_USER = "${zosSftpUser}"
+        env.ZOS_SFTP_HOST = "${zosSftpHost}"
+        env.ZOS_SFTP_PORT = "${zosSftpPort}"
+        env.WORKSPACE_ZOS = "${zosSftpTargetFolder}"
+        env.WORKSPACE_DIST = "${target}"
+        withCredentials([sshUserPrivateKey(credentialsId: zosSshCredId, keyFileVariable: 'keyfile')]) {
+            def rc = sh (returnStatus: true, script: '''#!/usr/bin/env bash
+echo "sftp -i ${keyfile} -P ${ZOS_SFTP_PORT} -o "StrictHostKeyChecking=no" ${ZOS_SFTP_USER}@${ZOS_SFTP_HOST}"
+sftp -i ${keyfile} -P ${ZOS_SFTP_PORT} -o "StrictHostKeyChecking=no" ${ZOS_SFTP_USER}@${ZOS_SFTP_HOST} <<EOF
+cd $WORKSPACE_ZOS
+put $WORKSPACE_DIST/*/*/*/*/*/*
+EOF
+exit $?
+''')
+            if ( rc != 0 )
+                error("Download to artifactory failed!!!")
+        }
+    }
+  }
+}
+
+void downloadFromArtifactory(server, pattern, target){
+    server.download  spec:
+            """{
+                    "files": [
+                            {
+                                "pattern": "${pattern}",
+                                "target": "${target}"
+                            }
+                        ]
+            }"""
+}
