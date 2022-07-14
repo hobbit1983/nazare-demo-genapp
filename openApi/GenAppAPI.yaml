@@ -1,0 +1,146 @@
+openapi: 3.0.0
+info:
+  title: GenAppAPI
+  description: API for the General Insurance sample application.
+  version: "1.0"
+servers:
+- url: http://localhost:9080/
+- url: https://localhost:9443/
+security:
+- BasicAuth: []
+- BearerAuth: []
+paths:
+  /customers/{id}:
+    get:
+      tags:
+      - Discover
+      summary: Get a customer
+      description: Provides details for a given customer ID
+      operationId: customerIdGet
+      parameters:
+      - name: id
+        in: path
+        required: true
+        style: simple
+        explode: false
+        schema:
+          maxLength: 10
+          type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomerDetails'
+        "404":
+          description: Not Found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomerNotFound'
+        "500":
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+components:
+  schemas:
+    CustomerDetails:
+      type: object
+      properties:
+        customerNumber:
+          maxLength: 10
+          type: string
+        firstName:
+          maxLength: 10
+          type: string
+        lastName:
+          maxLength: 20
+          type: string
+        dateOfBirth:
+          maxLength: 10
+          type: string
+          format: date
+        address:
+          $ref: '#/components/schemas/CustomerAddress'
+        contactDetails:
+          $ref: '#/components/schemas/CustomerContacts'
+      example:
+        customerNumber: 0000000010
+        firstName: Joe
+        lastName: Bloggs
+        dateOfBirth: 1985-05-14
+        address:
+          houseNumber: A1
+          houseName: Hursley Park
+          postcode: SO21 2JN
+        contactDetails:
+          phone:
+            home: 01962 815058
+            mobile: 07700 900812
+          email: joe.blogs@mail.com
+    CustomerAddress:
+      type: object
+      properties:
+        houseNumber:
+          maxLength: 4
+          type: string
+        houseName:
+          maxLength: 20
+          type: string
+        postcode:
+          maxLength: 8
+          type: string
+      example:
+        houseNumber: A1
+        houseName: Hursley Park
+        postcode: SO21 2JN
+    CustomerContacts:
+      type: object
+      properties:
+        phone:
+          $ref: '#/components/schemas/CustomerPhoneContacts'
+        email:
+          maxLength: 100
+          type: string
+      example:
+        phone:
+          home: 01962 815058
+          mobile: 07700 900812
+        email: joe.blogs@mail.com
+    CustomerPhoneContacts:
+      type: object
+      properties:
+        home:
+          maxLength: 20
+          type: string
+        mobile:
+          maxLength: 20
+          type: string
+      example:
+        home: 01962 815058
+        mobile: 07700 900812
+    ErrorResponse:
+      type: object
+      properties:
+        message:
+          type: string
+      example:
+        message: A message describing the error
+    CustomerNotFound:
+      type: object
+      properties:
+        message:
+          type: string
+      example:
+        message: Customer number 9991019990 could not be found
+  securitySchemes:
+    BasicAuth:
+      type: http
+      scheme: basic
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
